@@ -94,14 +94,17 @@ fn is_restorable_accepts_empty_and_single_task_conversations() {
     assert!(conversation_with_tasks(vec![parentless_task("root", 0)]).is_restorable());
 }
 
+/// Conversations persisted before the provider cost was dropped still carry it; the blob must
+/// keep deserializing and the stale key must not be written back.
 #[test]
-fn conversation_usage_metadata_defaults_missing_provider_cost_to_unknown() {
+fn conversation_usage_metadata_ignores_a_persisted_provider_cost() {
     let metadata: ConversationUsageMetadata = serde_json::from_str(
-        r#"{"was_summarized":false,"context_window_usage":0.0,"credits_spent":0.0}"#,
+        r#"{"was_summarized":false,"context_window_usage":0.0,"credits_spent":1.5,"total_provider_cost_in_cents":3.2}"#,
     )
     .unwrap();
 
-    assert_eq!(metadata.total_provider_cost_in_cents, None);
+    assert_eq!(metadata.credits_spent, 1.5);
+    assert_eq!(metadata.total_billed_cost_in_cents, None);
     assert!(
         !serde_json::to_string(&metadata)
             .unwrap()
@@ -110,23 +113,51 @@ fn conversation_usage_metadata_defaults_missing_provider_cost_to_unknown() {
 }
 
 #[test]
-fn conversation_usage_metadata_preserves_known_zero_provider_cost() {
+fn conversation_usage_metadata_defaults_missing_billed_cost_to_unknown() {
     let metadata: ConversationUsageMetadata = serde_json::from_str(
-        r#"{"was_summarized":false,"context_window_usage":0.0,"credits_spent":0.0,"total_provider_cost_in_cents":0.0}"#,
+        r#"{"was_summarized":false,"context_window_usage":0.0,"credits_spent":0.0}"#,
     )
     .unwrap();
 
-    assert_eq!(metadata.total_provider_cost_in_cents, Some(0.0));
+    assert_eq!(metadata.total_billed_cost_in_cents, None);
+    assert_eq!(metadata.billed_cost_in_cents(), None);
     assert!(
-        serde_json::to_string(&metadata)
+        !serde_json::to_string(&metadata)
             .unwrap()
-            .contains("\"total_provider_cost_in_cents\":0.0")
+            .contains("total_billed_cost_in_cents")
     );
 }
 
+#[test]
+fn billed_cost_prefers_summed_charges_over_graphql_total() {
+    let metadata = ConversationUsageMetadata {
+        total_billed_cost_in_cents: Some(12.0),
+        total_charged_usage: Some(ChargedUsageTotals {
+            input_cost_in_cents: 3.0,
+            output_cost_in_cents: 4.0,
+            platform_cost_in_cents: 1.0,
+            web_search_cost_in_cents: 0.5,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert_eq!(metadata.billed_cost_in_cents(), Some(8.5));
+}
+
+#[test]
+fn billed_cost_falls_back_to_graphql_total_without_summed_charges() {
+    let metadata = ConversationUsageMetadata {
+        total_billed_cost_in_cents: Some(12.0),
+        ..Default::default()
+    };
+
+    assert_eq!(metadata.billed_cost_in_cents(), Some(12.0));
+}
+
 fn inference_usage_with_web_search(
-    input: u32,
-    output: u32,
+    input: u64,
+    output: u64,
     input_cost_in_cents: f32,
     output_cost_in_cents: f32,
     web_search_count: u32,
@@ -444,6 +475,22 @@ fn agent_conversation_data_skips_serializing_none_last_event_sequence() {
 }
 
 #[test]
+fn agent_conversation_data_roundtrips_use_warp_credits_instead_of_chatgpt() {
+    let data = AgentConversationData {
+        use_warp_credits_instead_of_chatgpt: true,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&data).expect("serialize");
+    let roundtripped: AgentConversationData = serde_json::from_str(&json).expect("deserialize");
+    assert!(roundtripped.use_warp_credits_instead_of_chatgpt);
+
+    let legacy_json = r#"{"server_conversation_token":null}"#;
+    let legacy: AgentConversationData =
+        serde_json::from_str(legacy_json).expect("legacy rows must deserialize");
+    assert!(!legacy.use_warp_credits_instead_of_chatgpt);
+}
+
+#[test]
 fn agent_conversation_data_roundtrips_pinned() {
     let data = AgentConversationData {
         pinned: true,
@@ -501,4 +548,42 @@ fn model_token_usage_replay_skips_non_custom_endpoint_entries() {
         ..Default::default()
     };
     assert!(warp_only.to_proto_custom_endpoint_usage().is_none());
+}
+
+#[test]
+fn charged_usage_totals_saturates_wide_wire_counts_and_cumulative_totals() {
+    let charges = api::RequestCharges {
+        usage_by_category: HashMap::from([(
+            "primary_agent".to_string(),
+            api::ChargedUsage {
+                direct_api_inference_usage: HashMap::from([(
+                    "model".to_string(),
+                    api::InferenceUsage {
+                        token_count: Some(api::TokenCount {
+                            input: u64::MAX,
+                            output: u64::from(u32::MAX) + 1,
+                            input_cache_read: u64::from(u32::MAX),
+                            input_cache_write: 1,
+                        }),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        )]),
+    };
+
+    let mut totals = ChargedUsageTotals::from(&charges);
+    assert_eq!(totals.input_tokens, u32::MAX);
+    assert_eq!(totals.output_tokens, u32::MAX);
+    assert_eq!(totals.input_cache_read_tokens, u32::MAX);
+    assert_eq!(totals.input_cache_write_tokens, 1);
+    assert_eq!(totals.total_tokens(), u32::MAX);
+
+    totals += totals;
+    assert_eq!(totals.input_tokens, u32::MAX);
+    assert_eq!(totals.output_tokens, u32::MAX);
+    assert_eq!(totals.input_cache_read_tokens, u32::MAX);
+    assert_eq!(totals.input_cache_write_tokens, 2);
+    assert_eq!(totals.total_tokens(), u32::MAX);
 }

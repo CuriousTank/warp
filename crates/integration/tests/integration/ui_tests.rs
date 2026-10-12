@@ -8,9 +8,11 @@ use super::integration_tests;
 
 integration_tests! {
     test_add_many_sessions,
+    test_child_pill_after_reopening_closed_parent_tab,
     test_ctrl_tab_session_switching,
     test_hover_over_menu,
     test_shell_reinitializing,
+    test_cloud_agent_shell_respawn,
     test_exit_multiple_tabs,
     test_execute_multiple_cursor_command,
     test_home_key_should_not_appear_in_input,

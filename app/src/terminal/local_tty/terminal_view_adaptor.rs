@@ -23,11 +23,14 @@ use session_sharing_protocol::sharer::{
 use warp_core::execution_mode::AppExecutionMode;
 use warp_core::send_telemetry_from_ctx;
 use warp_errors::report_error;
-use warpui::{AppContext, ModelHandle, SingletonEntity, ViewContext, ViewHandle, WindowId};
+use warpui::{
+    AppContext, ModelContext, ModelHandle, SingletonEntity, ViewContext, ViewHandle, WindowId,
+};
 
 use super::terminal_manager::{TerminalManager, TerminalSurfaceInit, TerminalSurfaceResult};
 use crate::NetworkStatus;
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
+use crate::ai::agent::BaseUserQuery;
 use crate::ai::agent::conversation::AIConversation;
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::blocklist::agent_view::{AgentViewController, AgentViewControllerEvent};
@@ -180,6 +183,24 @@ fn accept_agent_prompt(
         return;
     }
 
+    // warp-server-injected follow-ups carry the query itself. Viewer-typed prompts and older
+    // relays leave it unset; those are attributed to the viewer from presence so the server
+    // never records them as the sharer's own input. A payload that does not decode is sent
+    // with an explicit unavailable origin and falls back to `prompt` + `attachments`.
+    let base = match request.user_query_b64.as_deref() {
+        Some(encoded) => BaseUserQuery::decode_b64(encoded)
+            .unwrap_or_else(|| BaseUserQuery::unattributed("user_query_unavailable")),
+        None => {
+            let presence = terminal_view
+                .as_ref(ctx)
+                .shared_session_presence_manager()
+                .map(|manager| manager.as_ref(ctx));
+            let profile =
+                presence.and_then(|presence| presence.participant_profile(&participant_id));
+            BaseUserQuery::for_viewer(profile)
+        }
+    };
+
     // Execute the agent prompt in the Oz-harness case.
     terminal_view.update(ctx, |view, ctx| {
         // Restore the sharer's frozen visual state. The buffer is cleared by
@@ -199,6 +220,7 @@ fn accept_agent_prompt(
                 request.server_conversation_token,
                 request.attachments.clone(),
                 participant_id.clone(),
+                Some(base),
                 ctx,
             );
         });
@@ -1171,6 +1193,21 @@ impl TerminalManager<TerminalView> {
                         ToastFlavor::Error,
                         ctx,
                     );
+                });
+            }
+            NetworkEvent::ReconnectLimitReached { reason } => {
+                Self::shared_session_terminated(
+                    &terminal_view,
+                    shared_session_model_clone.clone(),
+                    model.clone(),
+                    ctx,
+                );
+
+                terminal_view.update(ctx, |view, ctx| {
+                    view.show_persistent_toast(reason.to_string(), ToastFlavor::Error, ctx);
+                    ctx.emit(TerminalViewEvent::SharedSessionFailed {
+                        reason: reason.to_string(),
+                    });
                 });
             }
             NetworkEvent::ControlActionRequested {
@@ -2185,6 +2222,21 @@ impl TerminalManager<TerminalView> {
 impl TerminalManagerTrait for TerminalManager<TerminalView> {
     fn model(&self) -> Arc<FairMutex<TerminalModel>> {
         self.model.clone()
+    }
+    fn recover_cloud_shell(
+        &mut self,
+        request: crate::terminal::shell_recovery::CloudShellRecoveryRequest,
+        ctx: &mut ModelContext<Box<dyn TerminalManagerTrait>>,
+    ) -> bool {
+        TerminalManager::recover_cloud_shell(self, request, ctx)
+    }
+
+    fn on_session_bootstrapped(
+        &mut self,
+        session_id: crate::terminal::model::session::SessionId,
+        ctx: &mut ModelContext<Box<dyn TerminalManagerTrait>>,
+    ) {
+        TerminalManager::on_session_bootstrapped(self, session_id, ctx);
     }
 
     fn on_view_detached(

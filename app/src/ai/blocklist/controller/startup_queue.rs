@@ -6,16 +6,16 @@ use warp_errors::report_error;
 use warpui::{ModelContext, SingletonEntity};
 
 use super::BlocklistAIController;
+use super::external_harness::ExternalHarnessPrompt;
 use super::shared_session::SharedSessionPromptTarget;
-use crate::ai::agent::AIAgentAttachment;
 use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::{AIAgentAttachment, BaseUserQuery};
 use crate::ai::attachment_utils::{
     build_file_attachment_map, download_task_file_attachments, resolve_agent_attachments,
 };
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::{
-    AutofireAction, BlocklistAIHistoryModel, QueuedPromptDeliveryMode, QueuedQuery, QueuedQueryId,
-    QueuedQueryModel,
+    BlocklistAIHistoryModel, QueuedPromptDeliveryMode, QueuedQuery, QueuedQueryId, QueuedQueryModel,
 };
 use crate::server::server_api::ServerApiProvider;
 
@@ -67,6 +67,7 @@ impl BlocklistAIController {
         let Some(id) = self.native_prompt_conversation_id.take() else {
             return;
         };
+        self.external_harness_prompt_sink = None;
         let unsent_count = QueuedQueryModel::as_ref(ctx).queue(id).len();
         log::info!(
             "event=native_queue_stopped task_id={:?} terminal_id={:?} conversation_id={id} unsent_count={unsent_count}",
@@ -104,6 +105,7 @@ impl BlocklistAIController {
         token: Option<&ServerConversationToken>,
         attachments: &[AgentAttachment],
         participant_id: &ParticipantId,
+        base: Option<&BaseUserQuery>,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
         let Some(bound_id) = self.native_prompt_conversation_id else {
@@ -115,6 +117,25 @@ impl BlocklistAIController {
             );
             return false;
         };
+        if let Some(sink) = &self.external_harness_prompt_sink {
+            log::info!(
+                "event=injection_routed_to_external_harness task_id={:?} terminal_id={:?} conversation_id={bound_id} participant_id={participant_id} attachment_count={}",
+                self.ambient_agent_task_id,
+                self.terminal_surface_id,
+                attachments.len(),
+            );
+            let relayed = ExternalHarnessPrompt {
+                text: prompt.to_owned(),
+                attachments: attachments.to_vec(),
+            };
+            if sink.try_send(relayed).is_err() {
+                report_error!(
+                    "Dropped a shared-session prompt because the external harness is no longer accepting prompts",
+                    extra: { "conversation_id" => %bound_id, "terminal_id" => ?self.terminal_surface_id }
+                );
+            }
+            return true;
+        }
         let id = match self.resolve_shared_session_prompt_target(token, ctx) {
             SharedSessionPromptTarget::Existing(id) => id,
             SharedSessionPromptTarget::Rejected { target } => {
@@ -141,40 +162,23 @@ impl BlocklistAIController {
             prompt.to_owned(),
             participant_id.clone(),
             attachments.to_vec(),
+            base.cloned(),
         );
+        let query_id = row.id();
+        let needs_preparation = !row.is_ready();
         QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
             queue.append(id, row, ctx);
         });
+        if needs_preparation {
+            self.prepare_queued_attachments(id, query_id, attachments.to_vec(), ctx);
+        }
         if self.can_dispatch_queued_warp_agent_prompt(id, ctx) {
             self.dispatch_queued_warp_agent_prompt(id, None, ctx);
         }
         true
     }
 
-    /// Dispatches a queued prompt row for `conversation_id` as its own fresh request, regardless
-    /// of whether it originated locally or from a shared-session injection: a local prompt via
-    /// [`Self::send_queued_user_query_in_conversation`], a shared-session-injected prompt via
-    /// the attachment-staging/download pipeline in [`Self::send_native_startup_injection`]. A
-    /// shell command, a locked row, or a row currently being edited is left queued for
-    /// `TerminalInput`/`TerminalView::drain_queued_prompts` to handle instead, since those need
-    /// the editor and PTY access this controller doesn't have.
-    ///
-    /// `query_id` selects a specific row -- used by an explicit override such as "Send now",
-    /// which may target a row other than the head and is allowed to interrupt an active stream
-    /// on purpose. `None` dispatches the head row in FIFO order, and only if
-    /// [`QueuedQueryModel::peek_autofire`] says it's a plain, unlocked, non-edited row; used by
-    /// every automatic trigger, which must check [`Self::can_dispatch_queued_warp_agent_prompt`]
-    /// first so this never interrupts an active stream.
-    ///
-    /// Either way, deferred (leaving the row queued) while a CLI subagent is active for
-    /// `conversation_id`, since interrupting an in-progress shell command is more disruptive
-    /// than interrupting an LLM turn; `TerminalView::drain_queued_prompts` re-attempts this the
-    /// next time any turn completes, so a deferred row is not stuck.
-    ///
-    /// Only ever dispatches **one** row: callers that want every currently-queued row flushed
-    /// must call this again once the previous row's send settles, not loop over it synchronously
-    /// -- looping would cancel each row's request before the previous one produced any output,
-    /// silently dropping every row but the last.
+    /// Sends a prepared queued prompt. An explicit ID may interrupt; automatic sends preserve FIFO.
     pub(crate) fn dispatch_queued_warp_agent_prompt(
         &mut self,
         conversation_id: AIConversationId,
@@ -190,28 +194,13 @@ impl BlocklistAIController {
             );
             return;
         }
+        let queue = QueuedQueryModel::as_ref(ctx);
         let row = match query_id {
-            Some(query_id) => QueuedQueryModel::as_ref(ctx)
-                .queue(conversation_id)
-                .iter()
-                .find(|row| row.id() == query_id)
-                .filter(|row| !row.is_command())
-                .cloned(),
-            // Only a plain, unlocked, non-edited row is safe to fire automatically here; a
-            // command, a locked row, or one being edited needs `TerminalInput`/
-            // `drain_queued_prompts` instead, so leave it queued for those to pick up.
-            None => match QueuedQueryModel::as_ref(ctx).peek_autofire(conversation_id) {
-                Some(AutofireAction::Submit { query_id, .. }) => QueuedQueryModel::as_ref(ctx)
-                    .queue(conversation_id)
-                    .iter()
-                    .find(|row| row.id() == query_id)
-                    .cloned(),
-                Some(
-                    AutofireAction::ExecuteCommand { .. } | AutofireAction::PopFromEditMode { .. },
-                )
-                | None => None,
-            },
-        };
+            Some(query_id) => queue.ready_query(conversation_id, query_id),
+            None => queue.ready_head(conversation_id),
+        }
+        .filter(|row| !row.is_command())
+        .cloned();
         let Some(row) = row else {
             return;
         };
@@ -222,16 +211,10 @@ impl BlocklistAIController {
             self.terminal_surface_id,
         );
         if row.shared_session_prompt().is_some() {
-            // `send_native_startup_injection` takes ownership of the row directly rather than
-            // re-resolving it by id, so it's safe to remove up front. Arming the in-flight
-            // marker first (in the same update call, before removal's `Removed` event is
-            // delivered) keeps `has_pending_native_injections` true across the async download
-            // gap that can follow -- see that method's doc comment.
+            self.send_native_startup_injection(conversation_id, row, ctx);
             QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
-                queue.arm_download_in_flight(conversation_id);
                 queue.remove_fired_row(conversation_id, row_id, ctx);
             });
-            self.send_native_startup_injection(conversation_id, row, ctx);
         } else {
             // The send path resolves this row's attachments by id, so it must still be in the
             // queue when this is called; remove it only afterward.
@@ -248,12 +231,7 @@ impl BlocklistAIController {
         }
     }
 
-    /// Resolves `row`'s attachments and sends it into `conversation_id` via the normal
-    /// existing-conversation follow-up path, which cancels any turn already in flight before
-    /// sending. Block and plain-text attachments are staged onto the live context model (the
-    /// same way `execute_warp_agent_prompt_from_shared_session_injection` stages them for a
-    /// live, non-startup injection) so the standard send path picks them up automatically; file
-    /// attachments are downloaded asynchronously first.
+    /// Sends a prepared shared-session prompt with its attributed context.
     fn send_native_startup_injection(
         &mut self,
         conversation_id: AIConversationId,
@@ -268,11 +246,13 @@ impl BlocklistAIController {
         };
         let participant_id = participant_id.clone();
         let attachments = attachments.to_vec();
-        let query_id = row.id();
         let text = row.text().to_owned();
+        let Some(file_attachments) = row.prepared_files().cloned() else {
+            return;
+        };
+        let base = row.base_user_query().cloned();
 
-        let (block_ids, selected_text_parts, file_downloads) =
-            resolve_agent_attachments(attachments);
+        let (block_ids, selected_text_parts, _) = resolve_agent_attachments(attachments);
         self.context_model.update(ctx, |context_model, ctx| {
             if !block_ids.is_empty() {
                 context_model.set_pending_context_block_ids(block_ids, false, ctx);
@@ -286,17 +266,24 @@ impl BlocklistAIController {
             }
         });
 
-        if file_downloads.is_empty() {
-            self.dispatch_native_startup_injection(
-                conversation_id,
-                text,
-                participant_id,
-                HashMap::new(),
-                ctx,
-            );
-            return;
-        }
+        self.dispatch_native_startup_injection(
+            conversation_id,
+            text,
+            participant_id,
+            file_attachments,
+            base,
+            ctx,
+        );
+    }
 
+    fn prepare_queued_attachments(
+        &mut self,
+        conversation_id: AIConversationId,
+        query_id: QueuedQueryId,
+        attachments: Vec<AgentAttachment>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let (_, _, file_downloads) = resolve_agent_attachments(attachments);
         log::info!(
             "event=queued_attachment_download_started conversation_id={conversation_id} query_id={query_id:?} file_count={}",
             file_downloads.len(),
@@ -309,13 +296,9 @@ impl BlocklistAIController {
                 "Missing native attachment download configuration for a queued startup injection",
                 extra: { "conversation_id" => %conversation_id, "query_id" => ?query_id }
             );
-            self.dispatch_native_startup_injection(
-                conversation_id,
-                text,
-                participant_id,
-                HashMap::new(),
-                ctx,
-            );
+            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
+                queue.complete_preparation(conversation_id, query_id, HashMap::new(), ctx);
+            });
             return;
         };
         let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
@@ -328,36 +311,29 @@ impl BlocklistAIController {
                 directory,
                 file_downloads,
             ),
-            move |controller, downloaded, ctx| {
-                let file_attachments = build_file_attachment_map(&downloaded);
-                controller.dispatch_native_startup_injection(
-                    conversation_id,
-                    text,
-                    participant_id,
-                    file_attachments,
-                    ctx,
-                );
+            move |_, downloaded, ctx| {
+                QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
+                    queue.complete_preparation(
+                        conversation_id,
+                        query_id,
+                        build_file_attachment_map(&downloaded),
+                        ctx,
+                    );
+                });
             },
         );
     }
 
-    /// Sends the fully-resolved `text`/`file_attachments` into `conversation_id`, via the same
-    /// path used for a live (non-startup) shared-session follow-up targeting an existing
-    /// conversation (`send_warp_agent_prompt_from_shared_session_injection`). Every path that
-    /// removed a row via [`QueuedQueryModel::arm_download_in_flight`] funnels through here, so
-    /// clearing that marker unconditionally at the top covers all of them, including the two
-    /// synchronous paths that never needed a download in the first place.
+    /// Submits an attributed prompt with resolved file attachments.
     fn dispatch_native_startup_injection(
         &mut self,
         conversation_id: AIConversationId,
         text: String,
         participant_id: ParticipantId,
         file_attachments: HashMap<String, AIAgentAttachment>,
+        base: Option<BaseUserQuery>,
         ctx: &mut ModelContext<Self>,
     ) {
-        QueuedQueryModel::handle(ctx).update(ctx, |queue, _ctx| {
-            queue.clear_download_in_flight(conversation_id);
-        });
         if FeatureFlag::AgentView.is_enabled() {
             self.context_model.update(ctx, |context_model, ctx| {
                 context_model.set_pending_query_state_for_existing_conversation(
@@ -372,6 +348,7 @@ impl BlocklistAIController {
             conversation_id,
             Some(participant_id),
             file_attachments,
+            base,
             ctx,
         );
     }

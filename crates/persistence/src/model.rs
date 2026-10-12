@@ -1227,6 +1227,10 @@ pub struct AgentConversationData {
     /// pill bar. Orchestrator conversations always serialize as `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Whether the user chose Warp-funded inference for this conversation after a ChatGPT
+    /// token-sharing failure. Sent as `skip_chatgpt_subscription` on every request.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_warp_credits_instead_of_chatgpt: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1690,17 +1694,28 @@ impl ChargedUsageTotals {
     /// Total tokens across every category (input + output + cache-read + cache-write).
     pub fn total_tokens(&self) -> u32 {
         self.input_tokens
-            + self.output_tokens
-            + self.input_cache_read_tokens
-            + self.input_cache_write_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.input_cache_read_tokens)
+            .saturating_add(self.input_cache_write_tokens)
     }
 
     fn add_inference_usage(&mut self, usage: &api::InferenceUsage) {
         if let Some(token_count) = usage.token_count.as_ref() {
-            self.input_tokens += token_count.input;
-            self.output_tokens += token_count.output;
-            self.input_cache_read_tokens += token_count.input_cache_read;
-            self.input_cache_write_tokens += token_count.input_cache_write;
+            // Wire counts are u64 (proto TokenCount); persisted totals stay u32 and saturate.
+            // TODO(Xavientois): widen these fields to u64 to match the proto TokenCount and drop
+            // the saturating narrowing.
+            self.input_tokens = self
+                .input_tokens
+                .saturating_add(u32::try_from(token_count.input).unwrap_or(u32::MAX));
+            self.output_tokens = self
+                .output_tokens
+                .saturating_add(u32::try_from(token_count.output).unwrap_or(u32::MAX));
+            self.input_cache_read_tokens = self
+                .input_cache_read_tokens
+                .saturating_add(u32::try_from(token_count.input_cache_read).unwrap_or(u32::MAX));
+            self.input_cache_write_tokens = self
+                .input_cache_write_tokens
+                .saturating_add(u32::try_from(token_count.input_cache_write).unwrap_or(u32::MAX));
         }
         if let Some(token_cost) = usage.token_cost.as_ref() {
             self.input_cost_in_cents += token_cost.input_cost_in_cents;
@@ -1730,10 +1745,14 @@ impl std::ops::AddAssign for ChargedUsageTotals {
         self.input_cache_write_cost_in_credits += rhs.input_cache_write_cost_in_credits;
         self.platform_cost_in_cents += rhs.platform_cost_in_cents;
         self.platform_cost_in_credits += rhs.platform_cost_in_credits;
-        self.input_tokens += rhs.input_tokens;
-        self.output_tokens += rhs.output_tokens;
-        self.input_cache_read_tokens += rhs.input_cache_read_tokens;
-        self.input_cache_write_tokens += rhs.input_cache_write_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(rhs.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(rhs.output_tokens);
+        self.input_cache_read_tokens = self
+            .input_cache_read_tokens
+            .saturating_add(rhs.input_cache_read_tokens);
+        self.input_cache_write_tokens = self
+            .input_cache_write_tokens
+            .saturating_add(rhs.input_cache_write_tokens);
         self.web_search_count += rhs.web_search_count;
         self.web_search_cost_in_cents += rhs.web_search_cost_in_cents;
         self.web_search_cost_in_credits += rhs.web_search_cost_in_credits;
@@ -1771,11 +1790,12 @@ pub struct ConversationUsageMetadata {
     pub credits_spent: f32,
     #[serde(default)]
     pub platform_credits_spent: f32,
-    /// Server-authoritative cumulative provider cost in US cents. `None`
-    /// means the server did not provide a historical cost (for example, a
-    /// legacy conversation); it must not be treated as numeric zero.
+    /// Server-authoritative cumulative cost billed to the customer in US cents (inference at
+    /// the customer's own price plus platform cost), for conversations whose charges arrived
+    /// via GraphQL rather than the stream. `None` when the server could not establish a
+    /// complete billed total; it must not be treated as numeric zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_provider_cost_in_cents: Option<f32>,
+    pub total_billed_cost_in_cents: Option<f32>,
     #[serde(default)]
     pub credits_spent_for_last_block: Option<f32>,
     /// Per-category charged-usage breakdown for the most recent block (all
@@ -1802,6 +1822,16 @@ pub struct ConversationUsageMetadata {
 impl ConversationUsageMetadata {
     pub fn total_tool_calls(&self) -> i32 {
         self.tool_usage_metadata.total_tool_calls()
+    }
+
+    /// Cumulative cost billed to the customer so far in the conversation, in US cents.
+    /// Prefers the summed per-turn charges, which carry billed cents on the wire, and falls
+    /// back to the GraphQL total for conversations restored without them. `None` when neither
+    /// is known.
+    pub fn billed_cost_in_cents(&self) -> Option<f32> {
+        self.total_charged_usage
+            .map(|charged| charged.total_cost_in_cents())
+            .or(self.total_billed_cost_in_cents)
     }
 }
 
