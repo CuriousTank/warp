@@ -1348,7 +1348,12 @@ fn panes_granularity_search_matches_custom_tab_title_and_keeps_pane_matches() {
         // Searching the tab's custom title finds the renamed tab (#9666).
         let panel_state = panel_state_with_query("deploy");
         assert_eq!(
-            app.read(|ctx| panel_state.matching_tab_indices(&tabs, active_tab_index, ctx)),
+            app.read(|ctx| panel_state.matching_tab_indices(
+                &tabs,
+                &HashMap::new(),
+                active_tab_index,
+                ctx
+            )),
             vec![0]
         );
 
@@ -1357,7 +1362,12 @@ fn panes_granularity_search_matches_custom_tab_title_and_keeps_pane_matches() {
         // searchable text.
         let panel_state = panel_state_with_query("exp");
         assert_eq!(
-            app.read(|ctx| panel_state.matching_tab_indices(&tabs, active_tab_index, ctx)),
+            app.read(|ctx| panel_state.matching_tab_indices(
+                &tabs,
+                &HashMap::new(),
+                active_tab_index,
+                ctx
+            )),
             vec![0]
         );
 
@@ -1365,8 +1375,13 @@ fn panes_granularity_search_matches_custom_tab_title_and_keeps_pane_matches() {
         // filters everything out.
         let panel_state = panel_state_with_query("no-such-text");
         assert!(
-            app.read(|ctx| panel_state.matching_tab_indices(&tabs, active_tab_index, ctx))
-                .is_empty()
+            app.read(|ctx| panel_state.matching_tab_indices(
+                &tabs,
+                &HashMap::new(),
+                active_tab_index,
+                ctx
+            ))
+            .is_empty()
         );
     });
 }
